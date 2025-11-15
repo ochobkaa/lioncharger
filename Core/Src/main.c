@@ -44,12 +44,13 @@ typedef struct {
 	int32_t diff_mul;
 	int32_t sum_mul;
 	int32_t scale;
+	int32_t divider;
 } PID_Muls;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define V_MIN 0xF9CB3F9Cu
+#define V_MIN 0xDF07C1F0u
 #define V_MAX 0x2F1A9FBEu
 #define V_STABLE 0x73F9CB3Fu
 #define V_CONST 0x29374BC6u
@@ -63,11 +64,21 @@ typedef struct {
 #define DUTY_MIN 0x10u
 #define DUTY_MAX 0xEFu
 
-#define PID_D_MUL 1
-#define PID_I_MUL 1
-#define PID_P_MUL 1
-#define PID_SCALE_MUL 1
-#define PID_MUL_SUM PID_D_MUL + PID_I_MUL + PID_P_MUL
+#define PID_V_DIFF_MUL 1
+#define PID_I_DIFF_MUL 1
+#define PID_V_SUM_MUL 1
+#define PID_I_SUM_MUL 1
+#define PID_V_PROP_MUL 1
+#define PID_I_PROP_MUL 1
+#define PID_DIFF_MUL_SUM PID_V_DIFF_MUL + PID_I_DIFF_MUL
+#define PID_SUM_MUL_SUM PID_V_SUM_MUL + PID_I_SUM_MUL
+#define PID_PROP_MUL_SUM PID_V_PROP_MUL + PID_I_PROP_MUL
+#define PID_DIFF_SCALE 1
+#define PID_SUM_SCALE 1
+#define PID_PROP_SCALE 1
+#define PID_DIFF_DIVIDER 1
+#define PID_SUM_DIVIDER 1
+#define PID_PROP_DIVIDER 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -105,17 +116,17 @@ static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 void mainLoop(uint32_t* voltage, uint32_t* current,
 		GPIO_PinState* has_voltage, GPIO_PinState* has_current,
-		ChargeMode* current_mode, uint32_t* fillFactor);
+		ChargeMode* current_mode, PID* pid, PID_Muls* pid_muls);
 
 void getVoltage(uint32_t* voltage);
 void getVoltageAndCurrent(uint32_t* voltage, uint32_t* current);
 
 void setChargeMode(ChargeMode* current_mode, ChargeMode new_mode);
-void startPWM(void);
+void getPIDMuls(PID_Muls* pid_muls, uint32_t voltage, uint32_t current);
+uint32_t getPWMDuty(PID* pid, PID_Muls* pid_muls, ChargeMode mode, uint32_t voltage, uint32_t current);
+void startPWM(uint32_t duty);
 void stopPWM(void);
 
-uint32_t getPWMDuty(PID* pid, PID_Muls* pid_muls, ChargeMode mode, uint32_t voltage, uint32_t current);
-void changePWMDuty(uint32_t duty);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -166,7 +177,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  mainLoop(&voltage, &current, &hasVoltage, &hasCurrent, &current_mode, &fillFactor);
+	  mainLoop(&voltage, &current, &hasVoltage, &hasCurrent, &current_mode, &pid, &pid_muls);
   }
   /* USER CODE END 3 */
 }
@@ -399,7 +410,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void mainLoop(uint32_t* voltage, uint32_t* current,
 		GPIO_PinState* has_voltage, GPIO_PinState* has_current,
-		ChargeMode* current_mode, uint32_t* fillFactor) {
+		ChargeMode* current_mode, PID* pid, PID_Muls* pid_muls) {
 	*has_voltage = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_3);
 	*has_current = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4);
 
@@ -416,6 +427,7 @@ void mainLoop(uint32_t* voltage, uint32_t* current,
 		}
 		else if (*voltage < V_CONST && *voltage > V_MAX) {
 			setChargeMode(current_mode, CHARGE_CONST_V);
+
 			startPWM(DUTY_MIN);
 
 			pid->prop = DUTY_MIN;
@@ -427,8 +439,18 @@ void mainLoop(uint32_t* voltage, uint32_t* current,
 			stopPWM();
 		}
 	}
-	if (*has_voltage == GPIO_PIN_SET && *has_current == GPIO_PIN_SET && *current_mode == CHARGE_CONST_I) {
+	else if (*has_voltage == GPIO_PIN_SET && *has_current == GPIO_PIN_SET && (*current_mode == CHARGE_CONST_I || *current_mode == CHARGE_CONST_V)) {
+		getVoltageAndCurrent(voltage, current);
 
+		getPIDMuls(pid_muls, *voltage, *current);
+		uint32_t duty = getPWMDuty(pid, pid_muls, *current_mode, *voltage, *current);
+		__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, duty);
+	}
+	else if (*has_voltage == GPIO_PIN_SET && *has_current == GPIO_PIN_RESET && *current_mode == CHARGE_CONST_V) {
+		setChargeMode(current_mode, CHARGE_FINISHED);
+	}
+	else if (*has_voltage == GPIO_PIN_RESET && *has_current == GPIO_PIN_RESET && *current_mode != CHARGE_OFF) {
+		setChargeMode(current_mode, CHARGE_OFF);
 	}
 }
 
@@ -469,7 +491,7 @@ void setChargeMode(ChargeMode* current_mode, ChargeMode new_mode) {
 
 void startPWM(uint32_t duty) {
 	if (HAL_TIM_GetChannelState(&htim4, TIM_CHANNEL_1) == HAL_TIM_CHANNEL_STATE_READY) {
-		__HAL_TIM_SET_COMPARE(&vtim, TIM_CHANNEL_1, duty);
+		__HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, duty);
 		HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_1);
 	}
 }
@@ -480,12 +502,18 @@ void stopPWM(void) {
 	}
 }
 
+void getPIDMuls(PID_Muls* pid_muls, uint32_t voltage, uint32_t current) {
+	pid_muls->diff_mul = PID_DIFF_SCALE * (PID_V_DIFF_MUL * voltage + PID_I_DIFF_MUL * current) / (PID_DIFF_DIVIDER * PID_DIFF_MUL_SUM);
+	pid_muls->sum_mul = PID_SUM_SCALE * (PID_V_SUM_MUL * voltage + PID_I_SUM_MUL * current) / (PID_SUM_DIVIDER * PID_SUM_MUL_SUM);
+	pid_muls->prop_mul = PID_PROP_SCALE * (PID_V_PROP_MUL * voltage + PID_I_PROP_MUL * current) / (PID_PROP_DIVIDER * PID_PROP_MUL_SUM);
+}
+
 uint32_t getPWMDuty(PID* pid, PID_Muls* pid_muls, ChargeMode mode, uint32_t voltage, uint32_t current) {
 	int32_t i_err;
 	if (mode == CHARGE_CONST_I) {
 		i_err = I_CONST - current;
 	}
-	else if (mode = CHARGE_CONST_V) {
+	else if (mode == CHARGE_CONST_V) {
 		i_err = V_CONST - voltage;
 	}
 
@@ -494,7 +522,7 @@ uint32_t getPWMDuty(PID* pid, PID_Muls* pid_muls, ChargeMode mode, uint32_t volt
 	pid->prop = i_err;
 
 	int32_t muls_sum = pid_muls->diff_mul + pid_muls->sum_mul + pid_muls->prop_mul;
-	int32_t duty = pid_muls->scale * (pid_muls->diff_mul * pid->diff + pid_muls->sum_mul * pid->sum + pid_muls->prop_mul * pid->prop) / muls_sum;
+	int32_t duty = pid_muls->scale * (pid_muls->diff_mul * pid->diff + pid_muls->sum_mul * pid->sum + pid_muls->prop_mul * pid->prop) / (pid_muls->divider * muls_sum);
 	if (duty > DUTY_MAX) {
 		duty = DUTY_MAX;
 	}
