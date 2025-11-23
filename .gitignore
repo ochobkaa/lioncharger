@@ -3,3 +3,4 @@ Debug
 Drivers/CMSIS/Include/
 *.o
 *.d
+.launch
